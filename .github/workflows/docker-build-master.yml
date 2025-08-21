@@ -14,7 +14,7 @@ on:
       force_build:
         description: 'Force build even if no code changes'
         required: false
-        default: false
+        default: 'false'
         type: boolean
 
 env:
