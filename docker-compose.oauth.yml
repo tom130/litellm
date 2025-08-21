@@ -1,0 +1,183 @@
+# Docker Compose configuration for LiteLLM with Claude OAuth support
+# This file extends the base docker-compose.yml with OAuth-specific configuration
+
+version: '3.8'
+
+services:
+  litellm:
+    build:
+      context: .
+      args:
+        target: runtime
+    image: ghcr.io/tom130/litellm:main-claude-oauth
+    ports:
+      - "4000:4000"
+    environment:
+      # Database configuration
+      DATABASE_URL: "postgresql://llmproxy:dbpassword9090@db:5432/litellm"
+      STORE_MODEL_IN_DB: "True"
+      
+      # Claude OAuth configuration
+      CLAUDE_OAUTH_CLIENT_ID: ${CLAUDE_OAUTH_CLIENT_ID}
+      CLAUDE_OAUTH_REDIRECT_URI: ${CLAUDE_OAUTH_REDIRECT_URI:-http://localhost:4000/auth/claude/callback}
+      CLAUDE_TOKEN_ENCRYPTION_KEY: ${CLAUDE_TOKEN_ENCRYPTION_KEY}
+      
+      # OAuth settings
+      ENABLE_CLAUDE_OAUTH: "true"
+      CLAUDE_OAUTH_AUTO_REFRESH: ${CLAUDE_OAUTH_AUTO_REFRESH:-true}
+      CLAUDE_OAUTH_REFRESH_THRESHOLD: ${CLAUDE_OAUTH_REFRESH_THRESHOLD:-300}
+      CLAUDE_OAUTH_SCOPES: ${CLAUDE_OAUTH_SCOPES:-claude:chat claude:models claude:read}
+      
+      # LiteLLM settings
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-1234}
+      LITELLM_MODE: ${LITELLM_MODE:-production}
+      
+      # Optional settings
+      UI_USERNAME: ${UI_USERNAME:-admin}
+      UI_PASSWORD: ${UI_PASSWORD:-admin}
+      LITELLM_EMAIL: ${LITELLM_EMAIL:-}
+      LITELLM_EMAIL_PASSWORD: ${LITELLM_EMAIL_PASSWORD:-}
+      
+      # Logging
+      LITELLM_LOG_LEVEL: ${LITELLM_LOG_LEVEL:-INFO}
+      DETAILED_DEBUG: ${DETAILED_DEBUG:-false}
+    
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./litellm_oauth_data:/app/oauth_data  # Persistent OAuth token storage
+      - ./ui:/app/ui:ro  # UI assets (read-only)
+    
+    command:
+      - "--config=/app/config.yaml"
+      - "--port=4000"
+      - "--num_workers=4"
+    
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 http://localhost:4000/health/liveliness || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    restart: unless-stopped
+    
+    networks:
+      - litellm_network
+
+  db:
+    image: postgres:16-alpine
+    restart: always
+    container_name: litellm_db
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: dbpassword9090
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./litellm/proxy/migrations/add_claude_oauth_tokens.sql:/docker-entrypoint-initdb.d/01-oauth.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d litellm -U llmproxy"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+    networks:
+      - litellm_network
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    container_name: litellm_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 5
+    networks:
+      - litellm_network
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    restart: always
+    networks:
+      - litellm_network
+
+  # Optional: Grafana for monitoring
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    restart: always
+    networks:
+      - litellm_network
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    restart: unless-stopped
+    networks:
+      - litellm_network
+    profiles:
+      - debug
+
+volumes:
+  prometheus_data:
+    driver: local
+  postgres_data:
+    name: litellm_postgres_data
+  redis_data:
+    name: litellm_redis_data
+  grafana_data:
+    name: litellm_grafana_data
+  pgadmin_data:
+    name: litellm_pgadmin_data
+
+networks:
+  litellm_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
