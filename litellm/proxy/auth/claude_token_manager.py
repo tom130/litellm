@@ -2,11 +2,12 @@
 Claude Token Manager
 
 Manages OAuth token lifecycle including storage, retrieval, refresh, and validation.
+Works with pre-existing Claude OAuth tokens obtained from Claude.ai.
 """
 
 import asyncio
-import json
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 from dataclasses import dataclass
 
@@ -22,11 +23,11 @@ class ClaudeTokenInfo:
     user_id: str
     access_token: str
     refresh_token: Optional[str]
-    expires_at: datetime
+    expires_at: int  # Unix timestamp
     scopes: List[str]
-    created_at: datetime
-    last_used: Optional[datetime] = None
+    is_max: bool = True
     refresh_count: int = 0
+    last_used: Optional[int] = None  # Unix timestamp
 
 
 class ClaudeTokenManager:
@@ -35,7 +36,7 @@ class ClaudeTokenManager:
     
     Features:
     - Automatic token refresh before expiration
-    - Token validation and health checks
+    - Token validation
     - Multi-user token isolation
     - Performance monitoring
     """
@@ -78,9 +79,13 @@ class ClaudeTokenManager:
     
     def start_refresh_monitor(self) -> None:
         """Start background task to monitor and refresh tokens."""
-        if self.refresh_task is None or self.refresh_task.done():
-            self.refresh_task = asyncio.create_task(self._refresh_monitor())
-            verbose_proxy_logger.info("Started Claude token refresh monitor")
+        try:
+            if self.refresh_task is None or self.refresh_task.done():
+                self.refresh_task = asyncio.create_task(self._refresh_monitor())
+                verbose_proxy_logger.info("Started Claude token refresh monitor")
+        except RuntimeError:
+            # No event loop available yet
+            verbose_proxy_logger.debug("Cannot start refresh monitor - no event loop")
     
     async def _refresh_monitor(self) -> None:
         """Background task to monitor and refresh expiring tokens."""
@@ -94,8 +99,8 @@ class ClaudeTokenManager:
     
     async def _check_and_refresh_tokens(self) -> None:
         """Check all active tokens and refresh those near expiration."""
-        current_time = datetime.now(timezone.utc)
-        refresh_threshold_time = current_time + timedelta(seconds=self.refresh_threshold)
+        current_time = int(time.time())
+        refresh_threshold_time = current_time + self.refresh_threshold
         
         tokens_to_refresh = []
         
@@ -141,23 +146,24 @@ class ClaudeTokenManager:
                         f"Refreshing token for user {user_id} (attempt {attempt + 1}/{max_retries})"
                     )
                     
-                    # Call OAuth handler to refresh
-                    new_token_response = await self.oauth_handler.refresh_access_token(
-                        token_info.refresh_token
-                    )
+                    # Set current tokens in handler
+                    self.oauth_handler.access_token = token_info.access_token
+                    self.oauth_handler.refresh_token = token_info.refresh_token
+                    self.oauth_handler.expires_at = token_info.expires_at
                     
-                    # Update token info
+                    # Call OAuth handler to refresh
+                    new_token_response = await self.oauth_handler.refresh_access_token()
+                    
+                    # Update token info with new format
                     new_token_info = ClaudeTokenInfo(
                         user_id=user_id,
-                        access_token=new_token_response["access_token"],
-                        refresh_token=new_token_response.get("refresh_token", token_info.refresh_token),
-                        expires_at=datetime.now(timezone.utc) + timedelta(
-                            seconds=new_token_response.get("expires_in", 3600)
-                        ),
-                        scopes=token_info.scopes,
-                        created_at=token_info.created_at,
-                        last_used=token_info.last_used,
-                        refresh_count=token_info.refresh_count + 1
+                        access_token=new_token_response["accessToken"],
+                        refresh_token=new_token_response.get("refreshToken", token_info.refresh_token),
+                        expires_at=new_token_response["expiresAt"],
+                        scopes=new_token_response.get("scopes", token_info.scopes),
+                        is_max=new_token_response.get("isMax", True),
+                        refresh_count=token_info.refresh_count + 1,
+                        last_used=token_info.last_used
                     )
                     
                     # Store updated token
@@ -201,21 +207,21 @@ class ClaudeTokenManager:
         # Store in memory
         self.active_tokens[user_id] = token_info
         
-        # Store in cache
+        # Store in cache - use new format
         if self.cache:
             cache_key = f"claude_token:{user_id}"
             cache_data = {
-                "access_token": token_info.access_token,
-                "refresh_token": token_info.refresh_token,
-                "expires_at": token_info.expires_at.isoformat(),
+                "accessToken": token_info.access_token,
+                "refreshToken": token_info.refresh_token,
+                "expiresAt": token_info.expires_at,
                 "scopes": token_info.scopes,
-                "created_at": token_info.created_at.isoformat(),
-                "last_used": token_info.last_used.isoformat() if token_info.last_used else None,
-                "refresh_count": token_info.refresh_count
+                "isMax": token_info.is_max,
+                "refresh_count": token_info.refresh_count,
+                "last_used": token_info.last_used
             }
             
-            ttl = int((token_info.expires_at - datetime.now(timezone.utc)).total_seconds())
-            await self.cache.async_set_cache(cache_key, cache_data, ttl=max(ttl, 60))
+            ttl = max(60, token_info.expires_at - int(time.time()))
+            await self.cache.async_set_cache(cache_key, cache_data, ttl=ttl)
         
         # Store in database (encrypted)
         if self.prisma_client:
@@ -248,13 +254,13 @@ class ClaudeTokenManager:
             if cache_data:
                 token_info = ClaudeTokenInfo(
                     user_id=user_id,
-                    access_token=cache_data["access_token"],
-                    refresh_token=cache_data.get("refresh_token"),
-                    expires_at=datetime.fromisoformat(cache_data["expires_at"]),
-                    scopes=cache_data["scopes"],
-                    created_at=datetime.fromisoformat(cache_data["created_at"]),
-                    last_used=datetime.fromisoformat(cache_data["last_used"]) if cache_data.get("last_used") else None,
-                    refresh_count=cache_data.get("refresh_count", 0)
+                    access_token=cache_data["accessToken"],
+                    refresh_token=cache_data.get("refreshToken"),
+                    expires_at=cache_data["expiresAt"],
+                    scopes=cache_data.get("scopes", ["org:create_api_key", "user:profile", "user:inference"]),
+                    is_max=cache_data.get("isMax", True),
+                    refresh_count=cache_data.get("refresh_count", 0),
+                    last_used=cache_data.get("last_used")
                 )
                 self.active_tokens[user_id] = token_info
         
@@ -262,13 +268,13 @@ class ClaudeTokenManager:
             return None
         
         # Update last used time
-        token_info.last_used = datetime.now(timezone.utc)
+        token_info.last_used = int(time.time())
         
         # Check if token needs refresh
-        current_time = datetime.now(timezone.utc)
+        current_time = int(time.time())
         
         if auto_refresh and self.auto_refresh:
-            refresh_threshold_time = current_time + timedelta(seconds=self.refresh_threshold)
+            refresh_threshold_time = current_time + self.refresh_threshold
             
             if token_info.expires_at <= refresh_threshold_time:
                 # Trigger refresh asynchronously
@@ -300,22 +306,19 @@ class ClaudeTokenManager:
                 user_id = uid
                 break
         
-        if not user_id:
-            # Check cache
-            if self.cache:
-                # This would require a reverse lookup implementation
-                pass
-        
         if user_id:
             # Verify token is not expired
             token_info = self.active_tokens.get(user_id)
-            if token_info and token_info.expires_at > datetime.now(timezone.utc):
+            if token_info and token_info.expires_at > int(time.time()):
+                # Determine available models based on isMax flag
+                models = ["claude-3-sonnet", "claude-3-opus"] if token_info.is_max else ["claude-3-sonnet"]
+                
                 return UserAPIKeyAuth(
                     api_key=token,
                     user_id=user_id,
                     user_role="claude_oauth_user",
                     team_id=None,
-                    models=["claude-3-sonnet", "claude-3-opus"]  # Claude Max models
+                    models=models
                 )
         
         return None
@@ -356,12 +359,12 @@ class ClaudeTokenManager:
         Returns:
             Dictionary with token statistics
         """
-        current_time = datetime.now(timezone.utc)
+        current_time = int(time.time())
         
         active_count = len(self.active_tokens)
         expiring_soon = sum(
             1 for token_info in self.active_tokens.values()
-            if token_info.expires_at <= current_time + timedelta(seconds=self.refresh_threshold)
+            if token_info.expires_at <= current_time + self.refresh_threshold
         )
         
         expired = sum(
@@ -373,12 +376,18 @@ class ClaudeTokenManager:
             token_info.refresh_count for token_info in self.active_tokens.values()
         )
         
+        max_users = sum(
+            1 for token_info in self.active_tokens.values()
+            if token_info.is_max
+        )
+        
         return {
             "active_tokens": active_count,
             "expiring_soon": expiring_soon,
             "expired": expired,
             "refreshing": len(self.refreshing_tokens),
             "total_refreshes": total_refreshes,
+            "max_users": max_users,
             "auto_refresh_enabled": self.auto_refresh,
             "refresh_threshold_seconds": self.refresh_threshold
         }
@@ -390,7 +399,7 @@ class ClaudeTokenManager:
         Returns:
             Number of tokens cleaned up
         """
-        current_time = datetime.now(timezone.utc)
+        current_time = int(time.time())
         expired_users = [
             user_id for user_id, token_info in self.active_tokens.items()
             if token_info.expires_at <= current_time and not token_info.refresh_token

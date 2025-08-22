@@ -1,0 +1,204 @@
+# LiteLLM Configuration for Claude OAuth Testing
+# This configuration uses OAuth authentication for all Claude models
+
+model_list:
+  # Claude Opus 4.1 - Latest and most capable model
+  - model_name: claude-opus-4.1
+    litellm_params:
+      model: claude-opus-4-1-20250805
+      api_key: oauth  # Use OAuth authentication
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+    model_info:
+      description: "Claude Opus 4.1 - Most capable model for complex tasks"
+      max_tokens: 4096
+      supports_function_calling: true
+      supports_vision: true
+
+  # Claude Opus 4.0
+  - model_name: claude-opus-4
+    litellm_params:
+      model: claude-opus-4-20250514
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+    model_info:
+      description: "Claude Opus 4.0 - Previous generation Opus"
+      max_tokens: 4096
+      supports_function_calling: true
+      supports_vision: true
+
+  # Claude Sonnet 4.0
+  - model_name: claude-sonnet-4
+    litellm_params:
+      model: claude-sonnet-4-20250514
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+    model_info:
+      description: "Claude Sonnet 4.0 - Balanced performance and cost"
+      max_tokens: 4096
+      supports_function_calling: true
+      supports_vision: true
+
+  # Claude Sonnet 3.7 - Latest Sonnet
+  - model_name: claude-sonnet-3.7
+    litellm_params:
+      model: claude-3-7-sonnet-20250219
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+    model_info:
+      description: "Claude Sonnet 3.7 - Latest Sonnet version"
+      max_tokens: 4096
+      supports_function_calling: true
+      supports_vision: true
+
+  # Claude Haiku 3.5 - Fast and efficient
+  - model_name: claude-haiku-3.5
+    litellm_params:
+      model: claude-3-5-haiku-20241022
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+    model_info:
+      description: "Claude Haiku 3.5 - Fast and cost-effective"
+      max_tokens: 4096
+      supports_function_calling: true
+      supports_vision: false
+
+  # Aliases for common names
+  - model_name: claude-opus
+    litellm_params:
+      model: claude-opus-4-1-20250805
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+
+  - model_name: claude-sonnet
+    litellm_params:
+      model: claude-3-7-sonnet-20250219
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+
+  - model_name: claude-haiku
+    litellm_params:
+      model: claude-3-5-haiku-20241022
+      api_key: oauth
+      api_base: https://api.anthropic.com/v1
+      custom_llm_provider: anthropic
+
+# General proxy settings
+general_settings:
+  # Master key for API authentication
+  master_key: ${LITELLM_MASTER_KEY:-sk-oauth-test-1234}
+  
+  # Database configuration - commented out to bypass Prisma issues
+  # database_url: ${DATABASE_URL:-postgresql://llmproxy:dbpassword9090@db:5432/litellm}
+  # store_model_in_db: true
+  
+  # Logging configuration
+  log_level: ${LITELLM_LOG_LEVEL:-INFO}
+  json_logs: false
+  detailed_debug: ${DETAILED_DEBUG:-false}
+  
+  # Request handling
+  request_timeout: 600
+  max_retries: 3
+  retry_after: 5
+  
+  # Rate limiting
+  max_parallel_requests: 100
+  max_budget: 1000.0
+  budget_duration: "30d"
+  
+  # UI settings
+  ui_access_mode: "admin"
+  ui_username: ${UI_USERNAME:-admin}
+  ui_password: ${UI_PASSWORD:-admin}
+
+# Claude OAuth specific configuration
+claude_oauth:
+  # Enable OAuth authentication
+  enabled: true
+  
+  # Token management
+  auto_refresh: true  # Automatically refresh tokens before expiration
+  refresh_buffer: 300  # Refresh tokens 5 minutes before expiration
+  
+  # Token storage
+  token_file: ${CLAUDE_TOKEN_FILE:-/app/.litellm/claude_tokens.json}
+  encryption_key: ${CLAUDE_TOKEN_ENCRYPTION_KEY}
+  
+  # OAuth flow settings
+  callback_timeout: 600  # 10 minutes for user to complete OAuth
+  state_expiry: 600  # OAuth state expires after 10 minutes
+  
+  # Scopes required
+  scopes:
+    - org:create_api_key
+    - user:profile
+    - user:inference
+
+# Router settings for load balancing
+router_settings:
+  routing_strategy: "least-busy"  # Options: simple-shuffle, least-busy, usage-based-routing
+  num_retries: 3
+  retry_after: 5
+  allowed_fails: 3
+  cooldown_time: 60
+  
+  # Model-specific settings
+  model_group_alias:
+    claude-best: ["claude-opus-4.1"]
+    claude-fast: ["claude-haiku-3.5"]
+    claude-balanced: ["claude-sonnet-3.7", "claude-sonnet-4"]
+
+# Litellm module settings
+litellm_settings:
+  drop_params: false
+  max_tokens: 4096
+  temperature: 0.7
+  
+  # Success callback settings
+  success_callback: ["langfuse", "prometheus"]
+  failure_callback: ["langfuse"]
+  
+  # Cache settings
+  cache: true
+  cache_params:
+    type: "redis"
+    host: ${REDIS_HOST:-redis}
+    port: ${REDIS_PORT:-6379}
+    ttl: 3600
+
+# Environment-specific settings
+environment_variables:
+  # OAuth tokens (will be set after login)
+  CLAUDE_ACCESS_TOKEN: ${CLAUDE_ACCESS_TOKEN}
+  CLAUDE_REFRESH_TOKEN: ${CLAUDE_REFRESH_TOKEN}
+  CLAUDE_EXPIRES_AT: ${CLAUDE_EXPIRES_AT}
+  
+  # Anthropic beta header for OAuth
+  ANTHROPIC_BETA_HEADER: "oauth-2025-04-20"
+  
+  # Optional monitoring
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+  LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
+
+# Alerting configuration (optional)
+alerting:
+  alerting_threshold: 300  # 5 minutes
+  alerting_types: ["llm_exceptions", "llm_too_slow", "llm_requests_hanging"]
+  
+  # Email alerting (optional)
+  email_alerting:
+    enabled: ${EMAIL_ALERTING_ENABLED:-false}
+    smtp_host: ${SMTP_HOST}
+    smtp_port: ${SMTP_PORT:-587}
+    smtp_username: ${SMTP_USERNAME}
+    smtp_password: ${SMTP_PASSWORD}
+    sender_email: ${SENDER_EMAIL}
+    receiver_email: ${RECEIVER_EMAIL}

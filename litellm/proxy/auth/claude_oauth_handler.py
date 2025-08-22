@@ -1,70 +1,83 @@
 """
-Claude OAuth Handler with PKCE Implementation
+Claude OAuth Token Handler
 
-Handles OAuth 2.0 authentication flow for Claude Max models with PKCE support.
-Provides secure token management and automatic refresh capabilities.
+Manages pre-existing Claude OAuth tokens (access_token, refresh_token, expires_at).
+This does NOT implement an OAuth flow - tokens must be obtained from Claude.ai directly.
 """
 
 import base64
-import hashlib
 import json
 import os
-import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode
+from typing import Any, Dict, Optional
 
 from cryptography.fernet import Fernet
-from fastapi import HTTPException, Request, Response, status
+from fastapi import HTTPException, status
 
 from litellm._logging import verbose_proxy_logger
 from litellm.caching import DualCache
-from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.utils import PrismaClient
+from litellm.proxy.auth.claude_oauth_flow import ClaudeOAuthFlow
+from litellm.proxy.auth.claude_oauth_db import ClaudeOAuthDatabase
 
 
 class ClaudeOAuthHandler:
     """
-    Handles Claude OAuth 2.0 authentication with PKCE flow.
+    Handles Claude OAuth token management.
+    
+    This handler manages OAuth tokens obtained from Claude.ai.
+    It integrates with ClaudeOAuthFlow for initial token acquisition.
     
     Features:
-    - PKCE (Proof Key for Code Exchange) implementation
+    - OAuth flow integration for initial setup
     - Secure token storage with encryption
-    - Automatic token refresh
+    - Automatic token refresh before expiration
     - Multi-user token management
     """
     
-    # OAuth endpoints
-    AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-    TOKEN_URL = "https://claude.ai/api/oauth/token"
-    USER_INFO_URL = "https://claude.ai/api/user"
+    # Anthropic API endpoints
+    TOKEN_REFRESH_URL = "https://api.anthropic.com/v1/oauth/refresh"
+    API_BASE_URL = "https://api.anthropic.com/v1"
     
-    # Default scopes for Claude API access
-    DEFAULT_SCOPES = ["claude:chat", "claude:models", "claude:read"]
+    # OAuth beta header required for OAuth requests
+    OAUTH_BETA_HEADER = "oauth-2025-04-20"
     
     def __init__(
         self,
-        client_id: Optional[str] = None,
-        redirect_uri: Optional[str] = None,
+        access_token: Optional[str] = None,
+        refresh_token: Optional[str] = None,
+        expires_at: Optional[int] = None,
         encryption_key: Optional[str] = None,
         prisma_client: Optional[PrismaClient] = None,
         cache: Optional[DualCache] = None,
+        oauth_flow: Optional[ClaudeOAuthFlow] = None,
     ):
         """
-        Initialize Claude OAuth handler.
+        Initialize Claude OAuth handler with existing tokens.
         
         Args:
-            client_id: OAuth client ID (can be set via CLAUDE_OAUTH_CLIENT_ID env var)
-            redirect_uri: OAuth redirect URI (can be set via CLAUDE_OAUTH_REDIRECT_URI env var)
-            encryption_key: Key for encrypting tokens (can be set via CLAUDE_TOKEN_ENCRYPTION_KEY env var)
+            access_token: Existing OAuth access token from Claude.ai
+            refresh_token: Existing OAuth refresh token from Claude.ai
+            expires_at: Token expiration timestamp (seconds since epoch)
+            encryption_key: Key for encrypting stored tokens
             prisma_client: Database client for token storage
             cache: Cache client for temporary storage
         """
-        self.client_id = client_id or os.getenv("CLAUDE_OAUTH_CLIENT_ID")
-        self.redirect_uri = redirect_uri or os.getenv(
-            "CLAUDE_OAUTH_REDIRECT_URI", "http://localhost:4000/auth/claude/callback"
-        )
+        # Load tokens from environment if not provided
+        self.access_token = access_token or os.getenv("CLAUDE_ACCESS_TOKEN")
+        self.refresh_token = refresh_token or os.getenv("CLAUDE_REFRESH_TOKEN")
+        
+        # Handle expires_at - can be string timestamp or int
+        if expires_at:
+            self.expires_at = int(expires_at) if isinstance(expires_at, (str, int)) else expires_at
+        else:
+            expires_at_env = os.getenv("CLAUDE_EXPIRES_AT")
+            if expires_at_env:
+                self.expires_at = int(expires_at_env)
+            else:
+                # Default to 1 hour from now if not provided
+                self.expires_at = int(time.time()) + 3600
         
         # Initialize encryption
         encryption_key = encryption_key or os.getenv("CLAUDE_TOKEN_ENCRYPTION_KEY")
@@ -80,262 +93,129 @@ class ClaudeOAuthHandler:
         
         self.prisma_client = prisma_client
         self.cache = cache
+        self.oauth_flow = oauth_flow or ClaudeOAuthFlow()
         
-        # Store PKCE verifiers temporarily
-        self.pkce_storage: Dict[str, Dict[str, Any]] = {}
+        # Setup database handler if prisma client available
+        if self.prisma_client:
+            self.db_handler = ClaudeOAuthDatabase(self.prisma_client, encryption_key)
+        else:
+            self.db_handler = None
+        
+        # Validate initial tokens if provided
+        if self.access_token and not self.refresh_token:
+            verbose_proxy_logger.warning(
+                "Access token provided without refresh token. Token refresh will not be possible."
+            )
+        elif not self.access_token and not self.refresh_token:
+            verbose_proxy_logger.info(
+                "No OAuth tokens provided. OAuth flow will be required for initial setup. "
+                "Run: litellm claude login"
+            )
     
-    def generate_pkce_pair(self) -> Tuple[str, str]:
+    def get_token_data(self) -> Dict[str, Any]:
         """
-        Generate PKCE code verifier and challenge.
+        Get current token data in the expected format.
         
         Returns:
-            Tuple of (code_verifier, code_challenge)
+            Dictionary with accessToken, refreshToken, expiresAt, etc.
         """
-        # Generate code verifier (43-128 characters)
-        code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
-        
-        # Generate code challenge using S256 method
-        challenge = hashlib.sha256(code_verifier.encode('utf-8')).digest()
-        code_challenge = base64.urlsafe_b64encode(challenge).decode('utf-8').rstrip('=')
-        
-        return code_verifier, code_challenge
-    
-    def generate_state(self, user_id: Optional[str] = None) -> str:
-        """
-        Generate secure state parameter for OAuth flow.
-        
-        Args:
-            user_id: Optional user ID to include in state
-            
-        Returns:
-            Secure state string
-        """
-        state_data = {
-            "nonce": secrets.token_urlsafe(32),
-            "timestamp": int(time.time()),
-            "user_id": user_id
+        return {
+            "accessToken": self.access_token,
+            "refreshToken": self.refresh_token,
+            "expiresAt": self.expires_at,
+            "scopes": ["org:create_api_key", "user:profile", "user:inference"],
+            "isMax": True  # Assuming these are Claude Max tokens
         }
-        state_json = json.dumps(state_data)
-        
-        # Encrypt state data
-        encrypted_state = self.cipher_suite.encrypt(state_json.encode())
-        return base64.urlsafe_b64encode(encrypted_state).decode('utf-8').rstrip('=')
     
-    def verify_state(self, state: str) -> Dict[str, Any]:
+    def is_token_expired(self, buffer_seconds: int = 300) -> bool:
         """
-        Verify and decrypt state parameter.
+        Check if the current token is expired or will expire soon.
         
         Args:
-            state: State string from OAuth callback
+            buffer_seconds: Seconds before actual expiry to consider token expired
             
         Returns:
-            Decrypted state data
+            True if token is expired or will expire within buffer
+        """
+        if not self.expires_at:
+            return True
+        
+        current_time = int(time.time())
+        return current_time >= (self.expires_at - buffer_seconds)
+    
+    async def refresh_access_token(self) -> Dict[str, Any]:
+        """
+        Refresh the access token using the refresh token.
+        
+        Returns:
+            New token data with updated access_token and expires_at
             
         Raises:
-            HTTPException: If state is invalid or expired
+            HTTPException: If refresh fails
         """
-        try:
-            # Decode and decrypt state
-            padded_state = state + '=' * (4 - len(state) % 4)
-            encrypted_state = base64.urlsafe_b64decode(padded_state)
-            decrypted_state = self.cipher_suite.decrypt(encrypted_state)
-            state_data = json.loads(decrypted_state.decode())
-            
-            # Check timestamp (expire after 10 minutes)
-            if time.time() - state_data["timestamp"] > 600:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="OAuth state expired"
-                )
-            
-            return state_data
-        except Exception as e:
-            verbose_proxy_logger.error(f"Failed to verify OAuth state: {e}")
+        if not self.refresh_token:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid OAuth state"
-            )
-    
-    def get_authorization_url(
-        self,
-        user_id: Optional[str] = None,
-        scopes: Optional[List[str]] = None,
-        additional_params: Optional[Dict[str, str]] = None
-    ) -> Tuple[str, str, str]:
-        """
-        Generate OAuth authorization URL with PKCE.
-        
-        Args:
-            user_id: User ID for state tracking
-            scopes: OAuth scopes to request
-            additional_params: Additional query parameters
-            
-        Returns:
-            Tuple of (authorization_url, state, code_verifier)
-        """
-        if not self.client_id:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Claude OAuth client ID not configured"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No refresh token available"
             )
         
-        # Generate PKCE pair
-        code_verifier, code_challenge = self.generate_pkce_pair()
-        
-        # Generate state
-        state = self.generate_state(user_id)
-        
-        # Store PKCE verifier for later use
-        self.pkce_storage[state] = {
-            "code_verifier": code_verifier,
-            "user_id": user_id,
-            "timestamp": time.time()
-        }
-        
-        # Clean up old PKCE verifiers (older than 10 minutes)
-        current_time = time.time()
-        self.pkce_storage = {
-            k: v for k, v in self.pkce_storage.items()
-            if current_time - v["timestamp"] < 600
-        }
-        
-        # Build authorization URL
-        params = {
-            "client_id": self.client_id,
-            "redirect_uri": self.redirect_uri,
-            "response_type": "code",
-            "scope": " ".join(scopes or self.DEFAULT_SCOPES),
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256"
-        }
-        
-        if additional_params:
-            params.update(additional_params)
-        
-        auth_url = f"{self.AUTHORIZE_URL}?{urlencode(params)}"
-        
-        return auth_url, state, code_verifier
-    
-    async def exchange_code_for_token(
-        self,
-        code: str,
-        state: str
-    ) -> Dict[str, Any]:
-        """
-        Exchange authorization code for access token.
-        
-        Args:
-            code: Authorization code from OAuth callback
-            state: State parameter from OAuth callback
-            
-        Returns:
-            Token response with access_token, refresh_token, etc.
-            
-        Raises:
-            HTTPException: If token exchange fails
-        """
-        # Verify state
-        state_data = self.verify_state(state)
-        
-        # Retrieve PKCE verifier
-        pkce_data = self.pkce_storage.get(state)
-        if not pkce_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="PKCE verifier not found"
-            )
-        
-        code_verifier = pkce_data["code_verifier"]
-        user_id = pkce_data.get("user_id")
-        
-        # Clean up PKCE storage
-        del self.pkce_storage[state]
-        
-        # Exchange code for token
         import httpx
         from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
         
         client = get_async_httpx_client()
         
-        token_data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": self.redirect_uri,
-            "client_id": self.client_id,
-            "code_verifier": code_verifier
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-beta": self.OAUTH_BETA_HEADER
+        }
+        
+        data = {
+            "refresh_token": self.refresh_token
         }
         
         try:
             response = await client.post(
-                self.TOKEN_URL,
-                data=token_data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"}
+                self.TOKEN_REFRESH_URL,
+                json=data,
+                headers=headers
             )
             response.raise_for_status()
             
             token_response = response.json()
             
-            # Add user_id to response
-            token_response["user_id"] = user_id
+            # Update stored tokens
+            self.access_token = token_response.get("access_token", token_response.get("accessToken"))
             
-            # Store token securely
-            await self.store_token(user_id, token_response)
+            # Update refresh token if a new one is provided
+            if "refresh_token" in token_response:
+                self.refresh_token = token_response["refresh_token"]
+            elif "refreshToken" in token_response:
+                self.refresh_token = token_response["refreshToken"]
             
-            return token_response
+            # Calculate new expiration time
+            if "expires_in" in token_response:
+                self.expires_at = int(time.time()) + token_response["expires_in"]
+            elif "expiresAt" in token_response:
+                self.expires_at = int(token_response["expiresAt"])
+            else:
+                # Default to 1 hour if not specified
+                self.expires_at = int(time.time()) + 3600
             
-        except httpx.HTTPStatusError as e:
-            verbose_proxy_logger.error(f"Token exchange failed: {e.response.text}")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to exchange code for token: {e.response.text}"
-            )
-        except Exception as e:
-            verbose_proxy_logger.error(f"Token exchange error: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Token exchange failed"
-            )
-    
-    async def refresh_access_token(self, refresh_token: str) -> Dict[str, Any]:
-        """
-        Refresh an access token using refresh token.
-        
-        Args:
-            refresh_token: Refresh token
+            verbose_proxy_logger.info("Successfully refreshed Claude OAuth token")
             
-        Returns:
-            New token response
-            
-        Raises:
-            HTTPException: If refresh fails
-        """
-        import httpx
-        from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
-        
-        client = get_async_httpx_client()
-        
-        refresh_data = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id
-        }
-        
-        try:
-            response = await client.post(
-                self.TOKEN_URL,
-                data=refresh_data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"}
-            )
-            response.raise_for_status()
-            
-            return response.json()
+            return self.get_token_data()
             
         except httpx.HTTPStatusError as e:
             verbose_proxy_logger.error(f"Token refresh failed: {e.response.text}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Failed to refresh token"
+                detail="Failed to refresh Claude OAuth token"
+            )
+        except Exception as e:
+            verbose_proxy_logger.error(f"Token refresh error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Token refresh failed"
             )
     
     def encrypt_token(self, token: str) -> str:
@@ -365,89 +245,119 @@ class ClaudeOAuthHandler:
         decrypted = self.cipher_suite.decrypt(encrypted_bytes)
         return decrypted.decode('utf-8')
     
-    async def store_token(
+    async def store_tokens(
         self,
         user_id: str,
-        token_response: Dict[str, Any]
+        token_data: Optional[Dict[str, Any]] = None
     ) -> None:
         """
-        Store OAuth tokens securely in database.
+        Store OAuth tokens securely.
         
         Args:
-            user_id: User ID
-            token_response: Token response from OAuth server
+            user_id: User ID for token association
+            token_data: Optional token data to store (uses instance tokens if not provided)
         """
-        if not self.prisma_client:
-            # Fallback to cache if no database
-            if self.cache:
-                cache_key = f"claude_oauth_token:{user_id}"
-                await self.cache.async_set_cache(cache_key, token_response, ttl=3600)
-            return
+        if not token_data:
+            token_data = self.get_token_data()
         
-        # Encrypt tokens
-        encrypted_access = self.encrypt_token(token_response["access_token"])
-        encrypted_refresh = self.encrypt_token(token_response.get("refresh_token", ""))
-        
-        # Calculate expiration
-        expires_in = token_response.get("expires_in", 3600)
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-        
-        # Store in database (implementation depends on schema)
-        # This is a placeholder - actual implementation would use Prisma schema
-        verbose_proxy_logger.info(f"Storing OAuth token for user {user_id}")
-    
-    async def get_valid_token(self, user_id: str) -> Optional[str]:
-        """
-        Get a valid access token for a user, refreshing if necessary.
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            Valid access token or None if not found
-        """
-        # Check cache first
+        # Store in cache for fast access
         if self.cache:
             cache_key = f"claude_oauth_token:{user_id}"
-            cached_token = await self.cache.async_get_cache(cache_key)
-            if cached_token:
-                # Check if token needs refresh
-                expires_at = cached_token.get("expires_at")
-                if expires_at:
-                    expiry_time = datetime.fromisoformat(expires_at)
-                    # Refresh if expiring in next 5 minutes
-                    if expiry_time - datetime.now(timezone.utc) < timedelta(minutes=5):
-                        try:
-                            new_token = await self.refresh_access_token(
-                                cached_token["refresh_token"]
-                            )
-                            new_token["user_id"] = user_id
-                            await self.store_token(user_id, new_token)
-                            return new_token["access_token"]
-                        except Exception as e:
-                            verbose_proxy_logger.error(f"Token refresh failed: {e}")
-                            return None
-                
-                return cached_token.get("access_token")
+            ttl = max(60, self.expires_at - int(time.time())) if self.expires_at else 3600
+            await self.cache.async_set_cache(cache_key, token_data, ttl=ttl)
+        
+        # Store encrypted tokens in database if available
+        if self.db_handler:
+            await self.db_handler.store_tokens(
+                user_id=user_id,
+                access_token=token_data.get("accessToken", self.access_token),
+                refresh_token=token_data.get("refreshToken", self.refresh_token),
+                expires_at=token_data.get("expiresAt", self.expires_at),
+                scopes=token_data.get("scopes", []),
+                created_by=user_id
+            )
+            verbose_proxy_logger.info(f"Stored OAuth tokens in database for user {user_id}")
+    
+    async def get_valid_token(
+        self,
+        user_id: Optional[str] = None,
+        auto_refresh: bool = True,
+        auto_oauth: bool = False
+    ) -> Optional[str]:
+        """
+        Get a valid access token, refreshing if necessary.
+        
+        Args:
+            user_id: Optional user ID to retrieve cached tokens
+            auto_refresh: Whether to automatically refresh expired tokens
+            
+        Returns:
+            Valid access token or None if unavailable
+        """
+        # Try to load from database first if user_id provided
+        if user_id and self.db_handler:
+            db_data = await self.db_handler.get_tokens(user_id)
+            if db_data:
+                self.access_token = db_data.get("accessToken")
+                self.refresh_token = db_data.get("refreshToken")
+                self.expires_at = db_data.get("expiresAt")
+                # Update cache
+                if self.cache:
+                    cache_key = f"claude_oauth_token:{user_id}"
+                    ttl = max(60, self.expires_at - int(time.time())) if self.expires_at else 3600
+                    await self.cache.async_set_cache(cache_key, db_data, ttl=ttl)
+        # Otherwise try cache
+        elif user_id and self.cache:
+            cache_key = f"claude_oauth_token:{user_id}"
+            cached_data = await self.cache.async_get_cache(cache_key)
+            if cached_data:
+                self.access_token = cached_data.get("accessToken")
+                self.refresh_token = cached_data.get("refreshToken")
+                self.expires_at = cached_data.get("expiresAt")
+        
+        # Check if token needs refresh
+        if auto_refresh and self.is_token_expired():
+            if self.refresh_token:
+                try:
+                    token_data = await self.refresh_access_token()
+                    if user_id:
+                        await self.store_tokens(user_id, token_data)
+                    return self.access_token
+                except Exception as e:
+                    verbose_proxy_logger.error(f"Failed to refresh token: {e}")
+                    return None
+            else:
+                verbose_proxy_logger.warning("Token expired but no refresh token available")
+                return None
+        
+        # Check if we have a valid token
+        if self.access_token and not self.is_token_expired(buffer_seconds=0):
+            return self.access_token
+        
+        # No valid token and OAuth flow requested
+        if auto_oauth and not self.access_token and not self.refresh_token:
+            verbose_proxy_logger.info(
+                "No OAuth tokens found. OAuth flow required. "
+                "Please run: litellm claude login"
+            )
+            return None
         
         return None
     
-    async def revoke_token(self, user_id: str) -> bool:
+    def get_auth_headers(self) -> Dict[str, str]:
         """
-        Revoke OAuth tokens for a user.
+        Get authentication headers for Claude API requests.
         
-        Args:
-            user_id: User ID
-            
         Returns:
-            True if successful
+            Dictionary of headers including Bearer token and beta header
         """
-        # Clear from cache
-        if self.cache:
-            cache_key = f"claude_oauth_token:{user_id}"
-            await self.cache.async_delete_cache(cache_key)
+        if not self.access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No Claude OAuth token available. Please run: litellm claude login"
+            )
         
-        # Clear from database (implementation depends on schema)
-        verbose_proxy_logger.info(f"Revoked OAuth token for user {user_id}")
-        
-        return True
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "anthropic-beta": self.OAUTH_BETA_HEADER
+        }

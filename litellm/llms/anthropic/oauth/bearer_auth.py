@@ -33,15 +33,23 @@ class ClaudeOAuthBearer:
         Returns:
             True if OAuth should be used
         """
-        if metadata and metadata.get("using_claude_oauth"):
-            return True
+        # Check metadata flags
+        if metadata:
+            if metadata.get("using_claude_oauth"):
+                return True
+            if metadata.get("claude_oauth_token"):
+                return True
         
         # Check if api_key looks like an OAuth token (Bearer token)
         if api_key and api_key.startswith("Bearer "):
             token = api_key.replace("Bearer ", "")
-            # OAuth tokens don't start with 'sk-' like API keys
-            if not token.startswith("sk-"):
+            # OAuth tokens don't start with 'sk-ant-' like Anthropic API keys
+            if not token.startswith("sk-ant-"):
                 return True
+        
+        # Check environment variable
+        if os.getenv("CLAUDE_ACCESS_TOKEN"):
+            return True
         
         return False
     
@@ -62,13 +70,17 @@ class ClaudeOAuthBearer:
         Returns:
             Modified headers with OAuth authentication
         """
-        # Get OAuth token from metadata or api_key
+        # Get OAuth token from various sources
         oauth_token = None
         
+        # Priority order: metadata > api_key > environment
         if metadata and metadata.get("claude_oauth_token"):
             oauth_token = metadata["claude_oauth_token"]
         elif api_key and api_key.startswith("Bearer "):
             oauth_token = api_key.replace("Bearer ", "")
+        elif not api_key or not api_key.startswith("sk-ant-"):
+            # Check environment if no valid API key
+            oauth_token = os.getenv("CLAUDE_ACCESS_TOKEN")
         
         if oauth_token:
             # Use OAuth bearer token instead of x-api-key
@@ -77,8 +89,8 @@ class ClaudeOAuthBearer:
             # Remove x-api-key header if present (OAuth takes precedence)
             headers.pop("x-api-key", None)
             
-            # Add OAuth-specific headers if needed
-            headers["X-OAuth-Client"] = "litellm-proxy"
+            # Add OAuth beta header - REQUIRED for OAuth
+            headers["anthropic-beta"] = "oauth-2025-04-20"
             
             verbose_logger.debug("Using OAuth bearer token for Claude API request")
         

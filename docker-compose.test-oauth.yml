@@ -1,0 +1,181 @@
+# Docker Compose for Testing Claude OAuth Implementation
+# Simplified version focused on OAuth testing
+
+services:
+  litellm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: litellm-litellm-1
+    image: litellm:oauth-test
+    ports:
+      - "4000:4000"
+    environment:
+      # Database configuration
+      DATABASE_URL: "postgresql://llmproxy:dbpassword9090@db:5432/litellm"
+      STORE_MODEL_IN_DB: "False"  # Disable DB storage for now to bypass Prisma issues
+      
+      # Master key for API access
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-oauth-test-1234}
+      
+      # Claude OAuth tokens (populated after login)
+      CLAUDE_ACCESS_TOKEN: ${CLAUDE_ACCESS_TOKEN:-}
+      CLAUDE_REFRESH_TOKEN: ${CLAUDE_REFRESH_TOKEN:-}
+      CLAUDE_EXPIRES_AT: ${CLAUDE_EXPIRES_AT:-}
+      
+      # Token encryption
+      CLAUDE_TOKEN_ENCRYPTION_KEY: ${CLAUDE_TOKEN_ENCRYPTION_KEY:-a1b2c3d4e5f6789012345678901234567890123456789012345678901234567890}
+      
+      # OAuth settings
+      ENABLE_CLAUDE_OAUTH: "true"
+      CLAUDE_OAUTH_AUTO_REFRESH: "true"
+      CLAUDE_OAUTH_REFRESH_THRESHOLD: "300"
+      
+      # Logging
+      LITELLM_LOG_LEVEL: ${LITELLM_LOG_LEVEL:-INFO}
+      DETAILED_DEBUG: ${DETAILED_DEBUG:-false}
+      
+      # UI credentials
+      UI_USERNAME: ${UI_USERNAME:-admin}
+      UI_PASSWORD: ${UI_PASSWORD:-admin}
+      
+      # Redis configuration
+      REDIS_URL: redis://redis:6379
+      
+      # Anthropic beta header for OAuth
+      ANTHROPIC_BETA_HEADER: "oauth-2025-04-20"
+      
+    volumes:
+      # Configuration file
+      - ./config.oauth.yaml:/app/config.yaml:ro
+      
+      # Persistent OAuth token storage
+      - oauth_tokens:/app/.litellm
+      
+      # UI assets (if they exist)
+      - ./ui:/app/ui:ro
+      
+    command:
+      - "--config=/app/config.yaml"
+      - "--port=4000"
+      - "--num_workers=1"
+      
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4000/health/liveliness || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+      
+    restart: unless-stopped
+    
+    networks:
+      - oauth_test_network
+
+  db:
+    image: postgres:16-alpine
+    container_name: litellm-db-1
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: dbpassword9090
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      
+    ports:
+      - "5432:5432"
+      
+    volumes:
+      # Database persistence
+      - postgres_data:/var/lib/postgresql/data
+      
+      # OAuth migrations
+      - ./litellm/proxy/migrations/add_claude_oauth_tokens.sql:/docker-entrypoint-initdb.d/01-oauth.sql:ro
+      
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d litellm -U llmproxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      
+    networks:
+      - oauth_test_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: litellm-redis-1
+      
+    volumes:
+      - redis_data:/data
+      
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      
+    networks:
+      - oauth_test_network
+
+  # Optional: Adminer for database inspection
+  adminer:
+    image: adminer:latest
+    container_name: litellm-adminer-1
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+      ADMINER_DESIGN: pepa-linha
+    depends_on:
+      - db
+    networks:
+      - oauth_test_network
+    profiles:
+      - debug
+
+  # Optional: Redis Commander for Redis inspection
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: litellm-redis-commander-1
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - oauth_test_network
+    profiles:
+      - debug
+
+volumes:
+  postgres_data:
+    name: litellm_oauth_test_postgres
+    driver: local
+    
+  redis_data:
+    name: litellm_oauth_test_redis
+    driver: local
+    
+  oauth_tokens:
+    name: litellm_oauth_tokens
+    driver: local
+
+networks:
+  oauth_test_network:
+    name: litellm_oauth_test
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
