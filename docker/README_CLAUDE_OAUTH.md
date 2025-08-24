@@ -8,221 +8,256 @@ This directory contains Docker configurations for LiteLLM with integrated Claude
 The primary LiteLLM proxy server with full Claude OAuth support.
 
 ```bash
-docker pull ghcr.io/tom130/litellm:main
+docker pull ghcr.io/berriai/litellm:main-stable
 ```
 
 **Features:**
-- Claude OAuth PKCE authentication
-- Automatic token refresh
-- Multi-user token management
-- Encrypted token storage
-- Support for all LiteLLM features
+- Claude OAuth 2.0 + PKCE authentication flow
+- Automatic token refresh before expiration
+- Database storage with AES-256 encryption
+- Multi-user token management with isolation
+- Storage hierarchy: Database → Cache → File → Environment
+- All standard LiteLLM features
 
 ### Database Image (`litellm/litellm-database`)
 LiteLLM with PostgreSQL integration for persistent OAuth token storage.
 
 ```bash
-docker pull ghcr.io/tom130/litellm-database:main
+docker pull ghcr.io/berriai/litellm-database:main
 ```
 
 **Features:**
-- PostgreSQL database included
-- OAuth token persistence
-- User management
-- Audit logging
-
-### Non-Root Image (`litellm/litellm-non-root`)
-Security-hardened image running as non-root user.
-
-```bash
-docker pull ghcr.io/tom130/litellm-non-root:main
-```
-
-**Features:**
-- Runs as UID 1000
-- Read-only root filesystem compatible
-- Suitable for Kubernetes with PSPs
+- PostgreSQL database for token persistence
+- OAuth token encryption and secure storage
+- Per-user token isolation
+- Audit logging with timestamps
+- Automatic token refresh tracking
 
 ## Quick Start with Claude OAuth
 
-### 1. Using Docker Compose
+### 1. Using Docker Compose (Recommended)
+
+Create `docker-compose.yml`:
 
 ```yaml
 version: '3.8'
 
 services:
   litellm:
-    image: ghcr.io/tom130/litellm:main
+    image: ghcr.io/berriai/litellm:main-stable
     ports:
       - "4000:4000"
     environment:
-      - DATABASE_URL=postgresql://litellm:password@postgres:5432/litellm
-      - CLAUDE_OAUTH_CLIENT_ID=${CLAUDE_OAUTH_CLIENT_ID}
-      - CLAUDE_OAUTH_REDIRECT_URI=http://localhost:4000/auth/claude/callback
-      - CLAUDE_TOKEN_ENCRYPTION_KEY=${CLAUDE_TOKEN_ENCRYPTION_KEY}
-      - MASTER_KEY=${MASTER_KEY:-sk-1234}
+      DATABASE_URL: "postgresql://llmproxy:dbpassword@db:5432/litellm"
+      CLAUDE_TOKEN_ENCRYPTION_KEY: "${CLAUDE_TOKEN_ENCRYPTION_KEY}"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY}"
     volumes:
       - ./config.yaml:/app/config.yaml
+      - oauth_tokens:/app/.litellm  # Fallback file storage
     depends_on:
-      - postgres
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
-  postgres:
-    image: postgres:15-alpine
+  db:
+    image: postgres:16
     environment:
-      - POSTGRES_DB=litellm
-      - POSTGRES_USER=litellm
-      - POSTGRES_PASSWORD=password
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: dbpassword
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./migrations/add_claude_oauth_tokens.sql:/docker-entrypoint-initdb.d/01-oauth.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmproxy -d litellm"]
+      interval: 5s
+      retries: 10
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  oauth_tokens:
 ```
 
-### 2. Using Docker Run
+### 2. Environment Configuration
+
+Create `.env` file:
 
 ```bash
-# Generate encryption key
-export CLAUDE_TOKEN_ENCRYPTION_KEY=$(openssl rand -base64 32)
+# Database (for persistent storage)
+DATABASE_URL=postgresql://llmproxy:dbpassword@db:5432/litellm
 
-# Run LiteLLM with Claude OAuth
-docker run -d \
-  --name litellm \
-  -p 4000:4000 \
-  -e CLAUDE_OAUTH_CLIENT_ID="your-client-id" \
-  -e CLAUDE_OAUTH_REDIRECT_URI="http://localhost:4000/auth/claude/callback" \
-  -e CLAUDE_TOKEN_ENCRYPTION_KEY="${CLAUDE_TOKEN_ENCRYPTION_KEY}" \
-  -e DATABASE_URL="sqlite:///app/litellm.db" \
-  -v $(pwd)/config.yaml:/app/config.yaml \
-  -v litellm_data:/app/data \
-  ghcr.io/tom130/litellm:main
+# OAuth Security
+CLAUDE_TOKEN_ENCRYPTION_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+
+# LiteLLM Master Key
+LITELLM_MASTER_KEY=sk-your-secure-master-key
+
+# Optional: Pre-existing tokens (for migration)
+CLAUDE_ACCESS_TOKEN=
+CLAUDE_REFRESH_TOKEN=
+CLAUDE_EXPIRES_AT=
 ```
 
-## Configuration
+### 3. Configuration File
 
-### Environment Variables
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `CLAUDE_OAUTH_CLIENT_ID` | OAuth client ID from Claude | Yes |
-| `CLAUDE_OAUTH_REDIRECT_URI` | OAuth callback URL | Yes |
-| `CLAUDE_TOKEN_ENCRYPTION_KEY` | AES-256 key for token encryption | Recommended |
-| `DATABASE_URL` | Database connection string | Recommended |
-| `MASTER_KEY` | LiteLLM master API key | Yes |
-
-### config.yaml Example
+Create `config.yaml`:
 
 ```yaml
 model_list:
-  - model_name: claude-3-sonnet
-    litellm_params:
-      model: anthropic/claude-3-sonnet-4-20250514
-      
   - model_name: claude-3-opus
     litellm_params:
-      model: anthropic/claude-3-opus-4-20250805
+      model: claude-3-opus-20240229
+      api_key: "oauth"  # Indicates OAuth authentication
+      
+  - model_name: claude-3-sonnet
+    litellm_params:
+      model: claude-3-sonnet-20240229
+      api_key: "oauth"
 
 general_settings:
-  master_key: ${MASTER_KEY}
-  enable_claude_oauth: true
-  
+  database_url: "${DATABASE_URL}"
+  master_key: "${LITELLM_MASTER_KEY}"
+
+# OAuth configuration
 claude_oauth:
   enabled: true
-  client_id: ${CLAUDE_OAUTH_CLIENT_ID}
-  redirect_uri: ${CLAUDE_OAUTH_REDIRECT_URI}
-  scopes: ["claude:chat", "claude:models", "claude:read"]
-  token_encryption: true
+  token_file: "~/.litellm/claude_tokens.json"  # Fallback when DB unavailable
+  encryption_key: "${CLAUDE_TOKEN_ENCRYPTION_KEY}"
   auto_refresh: true
-  refresh_threshold: 300
+  refresh_buffer: 300  # Refresh 5 minutes before expiration
+  use_database: true  # Enable database storage
 ```
 
-## Building Images Locally
-
-### Build Main Image
+### 4. Start Services
 
 ```bash
-docker build -t litellm:local .
+# Start containers
+docker-compose up -d
+
+# Check health
+docker-compose ps
+
+# View logs
+docker-compose logs -f litellm
 ```
 
-### Build with Specific Features
+## OAuth Authentication Flow in Docker
+
+### Initial Authentication
+
+1. **Start OAuth flow inside container:**
+```bash
+docker exec -it litellm-litellm-1 python -m litellm.proxy.auth.claude_oauth_cli login
+```
+
+2. **Visit the displayed URL in your browser**
+
+3. **Complete authentication with the code:**
+```bash
+docker exec -it litellm-litellm-1 python -m litellm.proxy.auth.claude_oauth_cli callback <CODE>
+```
+
+4. **Check status:**
+```bash
+docker exec -it litellm-litellm-1 python -m litellm.proxy.auth.claude_oauth_cli status
+```
+
+### Using the API
+
+Once authenticated, use Claude models through the proxy:
 
 ```bash
-# With Claude OAuth debug mode
-docker build \
-  --build-arg ENABLE_OAUTH_DEBUG=true \
-  -t litellm:oauth-debug .
-
-# With custom Python version
-docker build \
-  --build-arg LITELLM_BUILD_IMAGE=python:3.11-slim \
-  -t litellm:py311 .
+curl -X POST http://localhost:4000/chat/completions \
+  -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3-opus",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-### Multi-Platform Build
+## Database Migration
+
+The OAuth tokens table is automatically created on first run if using the docker-compose setup above.
+
+### Manual Migration
+
+If needed, run the migration manually:
 
 ```bash
-# Build for multiple architectures
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -t litellm:multiarch \
-  --push .
+# Copy migration file into container
+docker cp migrations/add_claude_oauth_tokens.sql litellm-db-1:/tmp/
+
+# Run migration
+docker exec litellm-db-1 psql -U llmproxy -d litellm -f /tmp/add_claude_oauth_tokens.sql
+
+# Verify table creation
+docker exec litellm-db-1 psql -U llmproxy -d litellm -c "\dt \"LiteLLM_ClaudeOAuthTokens\""
 ```
 
-## OAuth Authentication Flow
+## Token Storage Hierarchy
 
-1. **Initial Setup**
-   ```bash
-   # Start the container
-   docker-compose up -d
-   
-   # Check OAuth health
-   curl http://localhost:4000/auth/claude/health
-   ```
+LiteLLM uses a hierarchical storage system:
 
-2. **User Authentication**
-   ```bash
-   # Get authorization URL
-   curl http://localhost:4000/auth/claude/authorize \
-     -H "Authorization: Bearer YOUR_LITELLM_KEY"
-   ```
+1. **Database (Primary)** - PostgreSQL with encryption
+   - Per-user token isolation
+   - Audit trail with timestamps
+   - Automatic refresh tracking
 
-3. **Using Claude Models**
-   ```bash
-   # After OAuth authentication
-   curl -X POST http://localhost:4000/chat/completions \
-     -H "Authorization: Bearer YOUR_LITELLM_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "model": "claude-3-sonnet",
-       "messages": [{"role": "user", "content": "Hello!"}]
-     }'
-   ```
+2. **Cache (Performance)** - Redis/In-memory
+   - Fast token retrieval
+   - TTL-based expiration
 
-## Database Migrations
+3. **File (Fallback)** - Local filesystem
+   - Location: `/app/.litellm/claude_tokens.json`
+   - Used when database unavailable
+   - 0600 permissions for security
 
-When using PostgreSQL, run migrations on first start:
+4. **Environment (Legacy)** - Environment variables
+   - `CLAUDE_ACCESS_TOKEN`
+   - `CLAUDE_REFRESH_TOKEN`
+   - `CLAUDE_EXPIRES_AT`
 
-```bash
-# Using docker exec
-docker exec litellm prisma migrate deploy
-
-# Or include in startup script
-docker run --rm \
-  -e DATABASE_URL="postgresql://..." \
-  ghcr.io/tom130/litellm:main \
-  prisma migrate deploy
-```
-
-## Security Considerations
+## Security Best Practices
 
 ### Production Deployment
 
-1. **Use HTTPS**: Always use HTTPS for OAuth redirect URIs in production
-2. **Secure Keys**: Store encryption keys in secrets management (Kubernetes Secrets, Docker Secrets, etc.)
-3. **Network Isolation**: Use Docker networks to isolate database from public access
-4. **Regular Updates**: Pull latest images regularly for security patches
+1. **Use strong encryption keys:**
+```bash
+# Generate secure key
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+2. **Secure database connection:**
+```yaml
+environment:
+  DATABASE_URL: "postgresql://user:${DB_PASSWORD}@db:5432/litellm?sslmode=require"
+```
+
+3. **Use Docker secrets:**
+```yaml
+secrets:
+  claude_encryption_key:
+    external: true
+  db_password:
+    external: true
+
+services:
+  litellm:
+    secrets:
+      - claude_encryption_key
+      - db_password
+```
+
+4. **Network isolation:**
+```yaml
+networks:
+  backend:
+    internal: true
+  frontend:
+    external: true
+```
 
 ### Kubernetes Deployment
 
@@ -233,109 +268,180 @@ metadata:
   name: litellm
 spec:
   replicas: 2
-  selector:
-    matchLabels:
-      app: litellm
   template:
-    metadata:
-      labels:
-        app: litellm
     spec:
       containers:
       - name: litellm
-        image: ghcr.io/tom130/litellm-non-root:main
-        ports:
-        - containerPort: 4000
+        image: ghcr.io/berriai/litellm:main-stable
         env:
-        - name: CLAUDE_OAUTH_CLIENT_ID
+        - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
-              name: litellm-oauth
-              key: client-id
+              name: litellm-db
+              key: connection-string
         - name: CLAUDE_TOKEN_ENCRYPTION_KEY
           valueFrom:
             secretKeyRef:
               name: litellm-oauth
               key: encryption-key
-        securityContext:
-          runAsNonRoot: true
-          runAsUser: 1000
-          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+      volumes:
+      - name: config
+        configMap:
+          name: litellm-config
 ```
 
-## Monitoring
+## Monitoring and Health Checks
 
-### Health Checks
+### Docker Compose Health Check
 
 ```yaml
-# docker-compose.yml
 services:
   litellm:
-    # ... other config ...
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      test: ["CMD", "python", "-m", "litellm.proxy.auth.claude_oauth_cli", "status"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 ```
 
-### Logging
+### Manual Health Check
 
 ```bash
-# View logs
-docker logs litellm
+# Check OAuth status
+docker exec litellm-litellm-1 python -m litellm.proxy.auth.claude_oauth_cli status
 
-# Follow logs
-docker logs -f litellm
+# Check database connection
+docker exec litellm-db-1 pg_isready -U llmproxy -d litellm
 
-# Filter OAuth logs
-docker logs litellm 2>&1 | grep -i oauth
+# View token records
+docker exec litellm-db-1 psql -U llmproxy -d litellm -c "SELECT user_id, expires_at, refresh_count FROM \"LiteLLM_ClaudeOAuthTokens\";"
 ```
 
 ## Troubleshooting
 
 ### Common Issues
 
-**Container fails to start**
+**Container fails to start:**
 ```bash
 # Check logs
-docker logs litellm
+docker-compose logs litellm
 
 # Verify environment variables
-docker exec litellm env | grep CLAUDE
+docker exec litellm-litellm-1 env | grep -E "CLAUDE|DATABASE"
 ```
 
-**OAuth callback fails**
-- Ensure `CLAUDE_OAUTH_REDIRECT_URI` matches exactly in both environment and Claude OAuth settings
-- Check network connectivity from container
-
-**Token refresh errors**
+**Database connection errors:**
 ```bash
-# Check token manager status
-curl http://localhost:4000/auth/claude/health
+# Test database connection
+docker exec litellm-db-1 pg_isready
 
-# Manually refresh token
-curl -X POST http://localhost:4000/auth/claude/refresh \
-  -H "Authorization: Bearer YOUR_KEY"
+# Check if table exists
+docker exec litellm-db-1 psql -U llmproxy -d litellm -c "\dt"
 ```
 
-## CI/CD Integration
+**OAuth authentication fails:**
+```bash
+# Clear tokens and restart
+docker exec litellm-litellm-1 rm -f /app/.litellm/claude_tokens.json
+docker exec litellm-litellm-1 python -m litellm.proxy.auth.claude_oauth_cli logout
+docker-compose restart litellm
+```
 
-The Docker images are automatically built and pushed when:
-- Code is pushed to `main` branch
-- A new release is tagged
-- Manually triggered via GitHub Actions
+**Token refresh errors:**
+```bash
+# Check token expiration
+docker exec litellm-db-1 psql -U llmproxy -d litellm -c "SELECT user_id, expires_at, CASE WHEN expires_at > NOW() THEN 'valid' ELSE 'expired' END as status FROM \"LiteLLM_ClaudeOAuthTokens\";"
 
-### Image Tags
+# Force token refresh
+docker exec litellm-litellm-1 python -m litellm.proxy.auth.claude_oauth_cli refresh
+```
 
-- `main` - Latest from main branch
-- `main-{sha}` - Specific commit
-- `main-{date}` - Date-based tag (YYYYMMDD)
-- `main-claude-oauth` - Latest with OAuth support
+### Logging
+
+```bash
+# View all logs
+docker-compose logs
+
+# Follow specific service logs
+docker-compose logs -f litellm
+
+# Filter OAuth-related logs
+docker-compose logs litellm | grep -i "oauth\|token\|claude"
+
+# Enable debug logging
+docker-compose exec litellm sh -c "export LITELLM_LOG_LEVEL=DEBUG && python -m litellm"
+```
+
+## Backup and Recovery
+
+### Backup OAuth Tokens
+
+```bash
+# Database backup
+docker exec litellm-db-1 pg_dump -U llmproxy -d litellm -t "\"LiteLLM_ClaudeOAuthTokens\"" > oauth_tokens_backup.sql
+
+# File backup (if using file storage)
+docker cp litellm-litellm-1:/app/.litellm/claude_tokens.json ./claude_tokens_backup.json
+```
+
+### Restore OAuth Tokens
+
+```bash
+# Database restore
+docker cp oauth_tokens_backup.sql litellm-db-1:/tmp/
+docker exec litellm-db-1 psql -U llmproxy -d litellm -f /tmp/oauth_tokens_backup.sql
+
+# File restore
+docker cp ./claude_tokens_backup.json litellm-litellm-1:/app/.litellm/claude_tokens.json
+docker exec litellm-litellm-1 chmod 600 /app/.litellm/claude_tokens.json
+```
+
+## Multi-User Support
+
+With database storage, each user has isolated OAuth tokens:
+
+```sql
+-- View all user tokens
+SELECT 
+    u.user_id,
+    u.user_email,
+    t.expires_at,
+    t.refresh_count,
+    CASE 
+        WHEN t.expires_at > NOW() THEN 'active'
+        WHEN t.refresh_token_encrypted IS NOT NULL THEN 'expired_refreshable'
+        ELSE 'expired'
+    END AS status
+FROM "LiteLLM_UserTable" u
+LEFT JOIN "LiteLLM_ClaudeOAuthTokens" t ON u.user_id = t.user_id;
+```
+
+## Building Custom Images
+
+### Build with OAuth Support
+
+```bash
+# Clone repository
+git clone https://github.com/BerriAI/litellm.git
+cd litellm
+
+# Build image
+docker build -t litellm:oauth-custom .
+
+# Build multi-platform
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t litellm:oauth-multiarch \
+  --push .
+```
 
 ## Support
 
-- [GitHub Issues](https://github.com/tom130/litellm/issues)
-- [LiteLLM Documentation](https://docs.litellm.ai)
-- [Docker Hub](https://hub.docker.com/r/tom130/litellm)
+- [GitHub Issues](https://github.com/BerriAI/litellm/issues)
+- [Documentation](https://docs.litellm.ai/docs/proxy/claude_oauth)
+- [Discord Community](https://discord.gg/litellm)
