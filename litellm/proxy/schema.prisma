@@ -150,6 +150,32 @@ model LiteLLM_UserTable {
     invitations_updated LiteLLM_InvitationLink[] @relation("UpdatedBy")
     invitations_user    LiteLLM_InvitationLink[] @relation("UserId")
     object_permission LiteLLM_ObjectPermissionTable?   @relation(fields: [object_permission_id], references: [object_permission_id])
+    
+    // Claude OAuth tokens
+    claude_oauth_tokens LiteLLM_ClaudeOAuthTokens?
+}
+
+// Claude OAuth tokens table for secure token storage
+model LiteLLM_ClaudeOAuthTokens {
+    token_id                String    @id @default(uuid())
+    user_id                String    @unique
+    access_token_encrypted  String
+    refresh_token_encrypted String?
+    expires_at             DateTime
+    scopes                 String[]  @default([])
+    last_used              DateTime?
+    refresh_count          Int       @default(0)
+    created_at             DateTime  @default(now())
+    created_by             String
+    updated_at             DateTime  @default(now()) @updatedAt
+    updated_by             String
+    
+    // Relation to user
+    user LiteLLM_UserTable @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+    
+    @@index([user_id])
+    @@index([expires_at])
+    @@index([last_used])
 }
 
 model LiteLLM_ObjectPermissionTable {

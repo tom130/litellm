@@ -291,6 +291,10 @@ from litellm.proxy.management_endpoints.user_agent_analytics_endpoints import (
     router as user_agent_analytics_router,
 )
 from litellm.proxy.management_helpers.audit_logs import create_audit_log_for_update
+
+# Claude OAuth endpoints
+from litellm.proxy.auth.claude_oauth_endpoints import router as claude_oauth_router
+
 from litellm.proxy.middleware.prometheus_auth_middleware import PrometheusAuthMiddleware
 from litellm.proxy.openai_files_endpoints.files_endpoints import (
     router as openai_files_router,
@@ -632,6 +636,16 @@ async def proxy_startup_event(app: FastAPI):
         prisma_client=prisma_client,
         user_api_key_cache=user_api_key_cache,
     )
+
+    ## CLAUDE OAUTH ##
+    from litellm.proxy.auth.claude_oauth_endpoints import initialize_oauth_endpoints
+    encryption_key = get_secret("CLAUDE_TOKEN_ENCRYPTION_KEY", None)
+    initialize_oauth_endpoints(
+        prisma_client=prisma_client,
+        encryption_key=encryption_key,
+        cache=redis_usage_cache or user_api_key_cache
+    )
+    verbose_proxy_logger.info("Claude OAuth endpoints initialized")
 
     if use_background_health_checks:
         asyncio.create_task(
@@ -9412,6 +9426,7 @@ app.include_router(tag_management_router)
 app.include_router(user_agent_analytics_router)
 app.include_router(enterprise_router)
 app.include_router(ui_discovery_endpoints_router)
+app.include_router(claude_oauth_router)  # Claude OAuth endpoints
 ########################################################
 # MCP Server
 ########################################################

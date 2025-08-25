@@ -25,6 +25,7 @@ import { jwtDecode } from "jwt-decode"
 import { Typography } from "antd"
 import { clearTokenCookies } from "@/utils/cookieUtils"
 import { clearMCPAuthTokens } from "./mcp_tools/mcp_auth_storage"
+import ClaudeOAuthStatusBadge from "./claude_oauth_status_badge"
 
 export interface ProxySettings {
   PROXY_BASE_URL: string | null
@@ -356,6 +357,7 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
     <div className="w-full mx-4 h-[75vh]">
       <Grid numItems={1} className="gap-2 p-8 w-full mt-2">
         <Col numColSpan={1} className="flex flex-col gap-2">
+          <ClaudeOAuthStatusBadge accessToken={accessToken} />
           <CreateKey
             key={selectedTeam ? selectedTeam.team_id : null}
             userID={userID}

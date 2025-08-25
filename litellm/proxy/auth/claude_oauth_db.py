@@ -30,17 +30,18 @@ class ClaudeOAuthDatabase:
         
         # Setup encryption if key provided
         if encryption_key:
-            # Ensure key is 32 bytes for Fernet
-            if len(encryption_key) < 32:
-                encryption_key = encryption_key.ljust(32, '0')
-            elif len(encryption_key) > 32:
-                encryption_key = encryption_key[:32]
-            
-            # Convert to bytes and create Fernet instance
-            self.fernet = Fernet(Fernet.generate_key() if encryption_key == '0' * 32 else 
-                                 encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
+            # Use the provided key directly if it's valid, otherwise generate a new one
+            try:
+                # Try to use the provided key (Fernet requires base64 encoded 32-byte key)
+                self.fernet = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
+            except (ValueError, Exception) as e:
+                # If the key is invalid, generate a new one
+                import logging
+                logging.warning(f"Invalid encryption key provided for database, generating a temporary key: {e}")
+                self.fernet = Fernet(Fernet.generate_key())
         else:
-            self.fernet = None
+            # No key provided, generate one
+            self.fernet = Fernet(Fernet.generate_key())
     
     def _encrypt(self, data: str) -> str:
         """Encrypt a string."""

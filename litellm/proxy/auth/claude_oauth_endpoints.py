@@ -6,14 +6,21 @@ FastAPI endpoints for Claude OAuth authentication flow.
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status, Body
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.auth.claude_oauth_handler import ClaudeOAuthHandler
 from litellm.proxy.auth.claude_token_manager import ClaudeTokenManager
+from litellm.proxy.auth.claude_oauth_flow import ClaudeOAuthFlow
+
+# Request models
+class OAuthCallbackRequest(BaseModel):
+    code: str
+    state: str
 
 
 router = APIRouter(prefix="/auth/claude", tags=["Claude OAuth"])
@@ -22,6 +29,34 @@ router = APIRouter(prefix="/auth/claude", tags=["Claude OAuth"])
 # Global instances (will be initialized by proxy server)
 oauth_handler: Optional[ClaudeOAuthHandler] = None
 token_manager: Optional[ClaudeTokenManager] = None
+oauth_flow: Optional[ClaudeOAuthFlow] = None
+
+
+def initialize_oauth_endpoints(
+    prisma_client: Optional[Any] = None,
+    encryption_key: Optional[str] = None,
+    cache: Optional[Any] = None
+):
+    """Initialize OAuth endpoints with database and cache connections."""
+    global oauth_handler, token_manager, oauth_flow
+    
+    # Initialize OAuth handler with database support
+    oauth_handler = ClaudeOAuthHandler(
+        prisma_client=prisma_client,
+        encryption_key=encryption_key
+    )
+    
+    # Initialize token manager
+    token_manager = ClaudeTokenManager(
+        oauth_handler=oauth_handler,
+        prisma_client=prisma_client,
+        cache=cache
+    )
+    
+    # Initialize OAuth flow
+    oauth_flow = ClaudeOAuthFlow()
+    
+    verbose_proxy_logger.info("Claude OAuth endpoints initialized")
 
 
 def get_oauth_handler() -> ClaudeOAuthHandler:
@@ -44,191 +79,174 @@ def get_token_manager() -> ClaudeTokenManager:
     return token_manager
 
 
-@router.get("/authorize")
-async def authorize(
+@router.post("/start")
+async def start_oauth(
     request: Request,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
-    scopes: Optional[str] = Query(None, description="Space-separated OAuth scopes"),
-    redirect_uri: Optional[str] = Query(None, description="Custom redirect URI")
 ):
     """
-    Initiate Claude OAuth authorization flow.
+    Start Claude OAuth flow and return authorization URL.
     
-    This endpoint generates an authorization URL with PKCE parameters
-    and redirects the user to Claude's OAuth authorization page.
+    Returns:
+        JSON with authorization_url and state for the client to handle.
     """
-    handler = get_oauth_handler()
+    if not oauth_flow:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OAuth flow not initialized"
+        )
     
     # Get user ID from authenticated session
-    user_id = user_api_key_dict.user_id or user_api_key_dict.key_alias
-    
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User ID required for OAuth flow"
-        )
-    
-    # Parse scopes if provided
-    scope_list = scopes.split() if scopes else None
-    
-    # Additional parameters for OAuth flow
-    additional_params = {}
-    if redirect_uri:
-        additional_params["redirect_uri"] = redirect_uri
+    user_id = user_api_key_dict.user_id or user_api_key_dict.key_alias or "default_user"
     
     try:
-        # Generate authorization URL with PKCE
-        auth_url, state, code_verifier = handler.get_authorization_url(
-            user_id=user_id,
-            scopes=scope_list,
-            additional_params=additional_params
-        )
+        # Start OAuth flow
+        auth_url, state = await oauth_flow.start_flow()
         
-        # Store code_verifier in session or return to client
-        # For browser-based flow, redirect directly
-        return RedirectResponse(url=auth_url, status_code=status.HTTP_302_FOUND)
+        # Store state with user association (could use cache or session)
+        if oauth_handler:
+            # Store state temporarily for validation
+            await oauth_handler.store_state(state, user_id)
+        
+        return JSONResponse({
+            "authorization_url": auth_url,
+            "state": state,
+            "message": "Visit the authorization URL to complete authentication"
+        })
         
     except Exception as e:
-        verbose_proxy_logger.error(f"Failed to generate authorization URL: {e}")
+        verbose_proxy_logger.error(f"Failed to start OAuth flow: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
 
 
-@router.get("/callback")
+@router.post("/callback")
 async def callback(
     request: Request,
-    code: str = Query(..., description="Authorization code from Claude"),
-    state: str = Query(..., description="State parameter for CSRF protection"),
-    error: Optional[str] = Query(None, description="Error from OAuth provider"),
-    error_description: Optional[str] = Query(None, description="Error description")
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    body: Optional[OAuthCallbackRequest] = None,
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
 ):
     """
-    Handle OAuth callback from Claude.
+    Handle OAuth callback with authorization code.
     
-    This endpoint receives the authorization code from Claude's OAuth server
-    and exchanges it for access and refresh tokens.
+    This endpoint exchanges the authorization code for tokens and stores them.
+    Supports both automatic callback and manual code entry.
+    Accepts both JSON body and query parameters.
     """
-    # Check for OAuth errors
-    if error:
-        verbose_proxy_logger.error(f"OAuth error: {error} - {error_description}")
-        return HTMLResponse(
-            content=f"""
-            <html>
-                <body>
-                    <h2>Authentication Failed</h2>
-                    <p>Error: {error}</p>
-                    <p>{error_description or 'No additional details'}</p>
-                    <p><a href="/">Return to home</a></p>
-                </body>
-            </html>
-            """,
-            status_code=400
+    # Get code and state from either body or query params
+    if body:
+        code = body.code
+        state = body.state
+    
+    if not code or not state:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Missing required parameters: code and state"
+        )
+    if not oauth_flow or not oauth_handler:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OAuth not initialized"
         )
     
-    handler = get_oauth_handler()
-    manager = get_token_manager()
+    # Get user ID
+    user_id = user_api_key_dict.user_id or user_api_key_dict.key_alias or "default_user"
     
     try:
-        # Exchange code for tokens
-        token_response = await handler.exchange_code_for_token(code, state)
+        # Check if this is a manual code entry
+        is_manual = state == "manual_entry"
         
-        # Create token info for storage
-        from datetime import datetime, timedelta, timezone
-        from litellm.proxy.auth.claude_token_manager import ClaudeTokenInfo
+        if is_manual:
+            # For manual entry, we need to handle the code directly
+            # without state verification
+            verbose_proxy_logger.info(f"Processing manual OAuth code entry for user {user_id}")
+            
+            # Exchange code for tokens directly
+            token_data = await oauth_flow.exchange_code(code)
+        else:
+            # Normal OAuth flow with state verification
+            token_data = await oauth_flow.complete_flow(code, state)
         
-        token_info = ClaudeTokenInfo(
-            user_id=token_response["user_id"],
-            access_token=token_response["access_token"],
-            refresh_token=token_response.get("refresh_token"),
-            expires_at=datetime.now(timezone.utc) + timedelta(
-                seconds=token_response.get("expires_in", 3600)
-            ),
-            scopes=token_response.get("scope", "").split(),
-            created_at=datetime.now(timezone.utc)
+        # Store tokens using handler
+        success = await oauth_handler.store_tokens(
+            user_id=user_id,
+            token_data=token_data
         )
         
-        # Store token
-        await manager.store_token(token_response["user_id"], token_info)
+        if success:
+            return JSONResponse({
+                "success": True,
+                "message": "OAuth authentication successful",
+                "expires_in": token_data.get("expiresIn", 3600),
+                "manual": is_manual
+            })
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to store tokens"
+            )
         
-        # Return success page
-        return HTMLResponse(
-            content=f"""
-            <html>
-                <head>
-                    <title>Authentication Successful</title>
-                    <style>
-                        body {{
-                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                            max-width: 600px;
-                            margin: 50px auto;
-                            padding: 20px;
-                        }}
-                        .success {{
-                            background: #d4edda;
-                            border: 1px solid #c3e6cb;
-                            border-radius: 4px;
-                            padding: 15px;
-                            margin-bottom: 20px;
-                        }}
-                        code {{
-                            background: #f8f9fa;
-                            padding: 2px 5px;
-                            border-radius: 3px;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="success">
-                        <h2>✅ Authentication Successful!</h2>
-                        <p>Your Claude OAuth connection has been established.</p>
-                    </div>
-                    
-                    <h3>Next Steps:</h3>
-                    <p>You can now use Claude models through the LiteLLM proxy.</p>
-                    
-                    <p>Example request:</p>
-                    <pre><code>curl -X POST http://localhost:4000/chat/completions \\
-  -H "Authorization: Bearer YOUR_LITELLM_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{{
-    "model": "claude-3-sonnet",
-    "messages": [{{"role": "user", "content": "Hello!"}}]
-  }}'</code></pre>
-                    
-                    <p>Token expires in: {token_response.get('expires_in', 3600)} seconds</p>
-                    
-                    <script>
-                        // Auto-close window after 5 seconds if opened as popup
-                        setTimeout(() => {{
-                            if (window.opener) {{
-                                window.close();
-                            }}
-                        }}, 5000);
-                    </script>
-                </body>
-            </html>
-            """,
-            status_code=200
-        )
-        
-    except HTTPException as e:
-        raise e
     except Exception as e:
         verbose_proxy_logger.error(f"OAuth callback error: {e}")
-        return HTMLResponse(
-            content=f"""
-            <html>
-                <body>
-                    <h2>Authentication Failed</h2>
-                    <p>Failed to complete OAuth flow: {str(e)}</p>
-                    <p><a href="/auth/claude/authorize">Try again</a></p>
-                </body>
-            </html>
-            """,
-            status_code=500
+        # Provide more specific error message for manual entry
+        if state == "manual_entry":
+            error_msg = "Invalid or expired authentication code. Please get a new code from Claude."
+        else:
+            error_msg = f"Failed to complete OAuth flow: {str(e)}"
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
         )
+
+
+@router.get("/status")
+async def get_status(
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    """
+    Check OAuth authentication status for the current user.
+    """
+    if not oauth_handler:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OAuth not initialized"
+        )
+    
+    user_id = user_api_key_dict.user_id or user_api_key_dict.key_alias or "default_user"
+    
+    try:
+        # Check if user has valid tokens
+        token = await oauth_handler.get_valid_token(user_id=user_id, auto_refresh=False)
+        
+        if token:
+            # Get token expiration info
+            expires_in = oauth_handler.get_token_expiry(user_id)
+            
+            return JSONResponse({
+                "authenticated": True,
+                "user_id": user_id,
+                "expires_in": expires_in,
+                "needs_refresh": expires_in < 300 if expires_in else False
+            })
+        else:
+            return JSONResponse({
+                "authenticated": False,
+                "user_id": user_id,
+                "message": "No valid OAuth tokens found"
+            })
+    
+    except Exception as e:
+        verbose_proxy_logger.error(f"Failed to get OAuth status: {e}")
+        return JSONResponse({
+            "authenticated": False,
+            "error": str(e)
+        })
 
 
 @router.post("/refresh")
@@ -238,56 +256,28 @@ async def refresh_token(
 ):
     """
     Manually refresh the OAuth token for the authenticated user.
-    
-    This endpoint allows users to manually trigger a token refresh
-    before the automatic refresh occurs.
     """
-    handler = get_oauth_handler()
-    manager = get_token_manager()
-    
-    user_id = user_api_key_dict.user_id or user_api_key_dict.key_alias
-    
-    if not user_id:
+    if not oauth_handler:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User ID required"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="OAuth not initialized"
         )
     
-    # Get current token
-    token = await manager.get_token(user_id, auto_refresh=False)
-    
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No OAuth token found for user"
-        )
-    
-    # Get token info
-    token_info = manager.active_tokens.get(user_id)
-    
-    if not token_info or not token_info.refresh_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No refresh token available"
-        )
+    user_id = user_api_key_dict.user_id or user_api_key_dict.key_alias or "default_user"
     
     try:
-        # Perform refresh
-        success = await manager._refresh_token_with_retry(user_id, token_info)
+        # Refresh token
+        new_token = await oauth_handler.refresh_access_token(user_id=user_id)
         
-        if success:
-            new_token = await manager.get_token(user_id, auto_refresh=False)
-            return JSONResponse(
-                content={
-                    "success": True,
-                    "message": "Token refreshed successfully",
-                    "expires_in": 3600  # This would come from actual token response
-                }
-            )
+        if new_token:
+            return JSONResponse({
+                "success": True,
+                "message": "Token refreshed successfully"
+            })
         else:
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to refresh token"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No refresh token available or refresh failed"
             )
             
     except Exception as e:

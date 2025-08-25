@@ -7516,6 +7516,128 @@ export const perUserAnalyticsCall = async (
   }
 };
 
+// Claude OAuth API calls
+export const getClaudeOAuthStatus = async (accessToken: string | null) => {
+  if (!accessToken) {
+    throw new Error("No access token provided");
+  }
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/auth/claude/status`
+    : `/auth/claude/status`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(deriveErrorMessage(errorData));
+  }
+
+  return await response.json();
+};
+
+export const startClaudeOAuth = async (accessToken: string | null) => {
+  if (!accessToken) {
+    throw new Error("No access token provided");
+  }
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/auth/claude/start`
+    : `/auth/claude/start`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(deriveErrorMessage(errorData));
+  }
+
+  return await response.json();
+};
+
+export const completeClaudeOAuth = async (accessToken: string | null, code: string, state: string) => {
+  if (!accessToken) {
+    throw new Error("No access token provided");
+  }
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/auth/claude/callback`
+    : `/auth/claude/callback`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ code, state }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(deriveErrorMessage(errorData));
+  }
+
+  return await response.json();
+};
+
+export const refreshClaudeToken = async (accessToken: string | null) => {
+  if (!accessToken) {
+    throw new Error("No access token provided");
+  }
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/auth/claude/refresh`
+    : `/auth/claude/refresh`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(deriveErrorMessage(errorData));
+  }
+
+  return await response.json();
+};
+
+export const disconnectClaudeOAuth = async (accessToken: string | null) => {
+  if (!accessToken) {
+    throw new Error("No access token provided");
+  }
+  const url = proxyBaseUrl
+    ? `${proxyBaseUrl}/auth/claude/logout`
+    : `/auth/claude/logout`;
+
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      [globalLitellmHeaderName]: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(deriveErrorMessage(errorData));
+  }
+
+  return await response.json();
+};
+
 const deriveErrorMessage = (errorData: any): string => {
   return (errorData?.error && (errorData.error.message || errorData.error)) ||
     errorData?.message ||

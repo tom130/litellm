@@ -1,0 +1,62 @@
+# Simplified Dockerfile for OAuth testing
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    git \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only requirements first for better caching
+COPY pyproject.toml poetry.lock ./
+
+# Install Python dependencies using pip
+RUN pip install --upgrade pip && \
+    pip install poetry && \
+    poetry config virtualenvs.create false && \
+    poetry install --no-interaction --no-ansi --no-root --extras "proxy extra_proxy"
+
+# Install Node.js for UI build
+RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs
+
+# Copy the application code
+COPY . .
+
+# Build the UI first
+WORKDIR /app/ui/litellm-dashboard
+RUN npm install
+RUN NEXT_TELEMETRY_DISABLED=1 npm run build
+
+# Copy built UI to serving directory
+RUN mkdir -p /app/litellm/proxy/_experimental/out && \
+    cp -r out/* /app/litellm/proxy/_experimental/out/
+
+# Return to app directory and install litellm
+WORKDIR /app
+
+# Install litellm in development mode with console scripts
+RUN pip install -e . --no-deps
+
+# Generate Prisma client
+WORKDIR /app/litellm/proxy
+RUN prisma generate
+WORKDIR /app
+
+# Create necessary directories
+RUN mkdir -p /app/.litellm /app/ui
+
+# Expose the proxy port
+EXPOSE 4000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:4000/health/liveliness')" || exit 1
+
+# Default command
+CMD ["litellm", "--config", "/app/config.yaml", "--port", "4000", "--num_workers", "1"]

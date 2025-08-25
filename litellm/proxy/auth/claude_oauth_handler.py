@@ -73,18 +73,30 @@ class ClaudeOAuthHandler:
             self.expires_at = int(expires_at) if isinstance(expires_at, (str, int)) else expires_at
         else:
             expires_at_env = os.getenv("CLAUDE_EXPIRES_AT")
-            if expires_at_env:
-                self.expires_at = int(expires_at_env)
+            if expires_at_env and not expires_at_env.startswith("${"):
+                try:
+                    self.expires_at = int(expires_at_env)
+                except ValueError:
+                    # Default to 1 hour from now if invalid
+                    self.expires_at = int(time.time()) + 3600
             else:
-                # Default to 1 hour from now if not provided
+                # Default to 1 hour from now if not provided or is template string
                 self.expires_at = int(time.time()) + 3600
         
         # Initialize encryption
         encryption_key = encryption_key or os.getenv("CLAUDE_TOKEN_ENCRYPTION_KEY")
-        if encryption_key:
-            self.cipher_suite = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
+        if encryption_key and not encryption_key.startswith("${"):
+            try:
+                self.cipher_suite = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
+            except ValueError:
+                # Invalid key format, generate a new one
+                key = Fernet.generate_key()
+                self.cipher_suite = Fernet(key)
+                verbose_proxy_logger.warning(
+                    "Invalid encryption key format. Generated temporary key. Set CLAUDE_TOKEN_ENCRYPTION_KEY for production."
+                )
         else:
-            # Generate a new key if not provided
+            # Generate a new key if not provided or is template string
             key = Fernet.generate_key()
             self.cipher_suite = Fernet(key)
             verbose_proxy_logger.warning(
@@ -361,3 +373,132 @@ class ClaudeOAuthHandler:
             "Authorization": f"Bearer {self.access_token}",
             "anthropic-beta": self.OAUTH_BETA_HEADER
         }
+
+    async def store_state(self, state: str, user_id: str) -> bool:
+        """
+        Store OAuth state temporarily for validation.
+        
+        Args:
+            state: OAuth state parameter
+            user_id: User ID for state association
+            
+        Returns:
+            True if stored successfully
+        """
+        try:
+            # Store in cache with 10-minute expiration
+            if self.cache:
+                cache_key = f"claude_oauth_state:{state}"
+                state_data = {
+                    "user_id": user_id,
+                    "created_at": int(time.time())
+                }
+                await self.cache.async_set_cache(cache_key, state_data, ttl=600)  # 10 minutes
+                return True
+            else:
+                # Fallback: store in memory (not recommended for production)
+                if not hasattr(self, '_state_storage'):
+                    self._state_storage = {}
+                self._state_storage[state] = {
+                    "user_id": user_id,
+                    "created_at": int(time.time())
+                }
+                return True
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to store OAuth state: {e}")
+            return False
+
+    async def verify_state(self, state: str, user_id: str) -> bool:
+        """
+        Verify stored state matches the callback state.
+        
+        Args:
+            state: OAuth state parameter from callback
+            user_id: User ID to verify against
+            
+        Returns:
+            True if state is valid
+        """
+        try:
+            # Check cache first
+            if self.cache:
+                cache_key = f"claude_oauth_state:{state}"
+                state_data = await self.cache.async_get_cache(cache_key)
+                if state_data and state_data.get("user_id") == user_id:
+                    # Clean up used state
+                    await self.cache.async_delete_cache(cache_key)
+                    return True
+            else:
+                # Fallback: check memory storage
+                if hasattr(self, '_state_storage') and state in self._state_storage:
+                    state_data = self._state_storage[state]
+                    if state_data.get("user_id") == user_id:
+                        # Clean up used state
+                        del self._state_storage[state]
+                        return True
+            return False
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to verify OAuth state: {e}")
+            return False
+
+    def get_token_expiry(self, user_id: str = None) -> Optional[int]:
+        """
+        Get token expiration timestamp.
+        
+        Args:
+            user_id: User ID (optional, uses instance expiry if not provided)
+            
+        Returns:
+            Expiration timestamp or None
+        """
+        if user_id and self.db_handler:
+            # Try to get from database
+            try:
+                # This would require async, but keeping sync for compatibility
+                return self.expires_at
+            except Exception:
+                return self.expires_at
+        return self.expires_at
+
+    async def get_user_tokens(self, user_id: str) -> Optional[Dict]:
+        """
+        Get stored tokens for a user.
+        
+        Args:
+            user_id: User ID
+            
+        Returns:
+            Token data dict or None if not found
+        """
+        try:
+            # Check cache first for fast access
+            if self.cache:
+                cache_key = f"claude_oauth_token:{user_id}"
+                cached_tokens = await self.cache.async_get_cache(cache_key)
+                if cached_tokens:
+                    return cached_tokens
+            
+            # Try database if cache miss
+            if self.db_handler:
+                tokens = await self.db_handler.get_tokens(user_id)
+                if tokens:
+                    # Decrypt tokens
+                    token_data = {
+                        "access_token": self.decrypt_token(tokens["access_token"]),
+                        "refresh_token": self.decrypt_token(tokens["refresh_token"]) if tokens.get("refresh_token") else None,
+                        "expires_at": tokens["expires_at"],
+                        "scopes": tokens.get("scopes", [])
+                    }
+                    
+                    # Update cache
+                    if self.cache:
+                        cache_key = f"claude_oauth_token:{user_id}"
+                        ttl = max(60, tokens["expires_at"] - int(time.time()))
+                        await self.cache.async_set_cache(cache_key, token_data, ttl=ttl)
+                    
+                    return token_data
+            
+            return None
+        except Exception as e:
+            verbose_proxy_logger.error(f"Failed to get user tokens: {e}")
+            return None

@@ -5,9 +5,9 @@ services:
   litellm:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.oauth
     container_name: litellm-litellm-1
-    image: litellm:oauth-test
+    image: litellm:oauth-fixed
     ports:
       - "4000:4000"
     environment:
@@ -23,13 +23,13 @@ services:
       CLAUDE_REFRESH_TOKEN: ${CLAUDE_REFRESH_TOKEN:-}
       CLAUDE_EXPIRES_AT: ${CLAUDE_EXPIRES_AT:-}
       
-      # Token encryption
-      CLAUDE_TOKEN_ENCRYPTION_KEY: ${CLAUDE_TOKEN_ENCRYPTION_KEY:-a1b2c3d4e5f6789012345678901234567890123456789012345678901234567890}
-      
       # OAuth settings
       ENABLE_CLAUDE_OAUTH: "true"
       CLAUDE_OAUTH_AUTO_REFRESH: "true"
       CLAUDE_OAUTH_REFRESH_THRESHOLD: "300"
+      
+      # Token encryption - Base64 encoded 32-byte key for Fernet
+      CLAUDE_TOKEN_ENCRYPTION_KEY: "NM1Nq2dsnxmNcK8XdNjyNu3p9SElq7LLK5IDZsolAK4="
       
       # Logging
       LITELLM_LOG_LEVEL: ${LITELLM_LOG_LEVEL:-INFO}
@@ -56,6 +56,7 @@ services:
       - ./ui:/app/ui:ro
       
     command:
+      - "litellm"
       - "--config=/app/config.yaml"
       - "--port=4000"
       - "--num_workers=1"

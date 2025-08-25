@@ -16,7 +16,54 @@ The Claude OAuth implementation provides:
 
 ## Quick Start
 
-### 1. Initial Authentication
+### Method 1: API Endpoints (Recommended for Web/Production)
+
+Use the proxy server's OAuth API endpoints for web applications:
+
+#### 1. Start OAuth Flow
+```bash
+curl -X POST http://localhost:4000/auth/claude/start \
+  -H "Authorization: Bearer YOUR_LITELLM_KEY" \
+  -H "Content-Type: application/json"
+```
+
+Response:
+```json
+{
+  "authorization_url": "https://claude.ai/oauth/authorize?...",
+  "state": "random_state_string",
+  "message": "Visit the authorization URL to complete authentication"
+}
+```
+
+#### 2. Complete Authentication
+After authorization, call the callback with the code:
+```bash
+curl -X POST http://localhost:4000/auth/claude/callback \
+  -H "Authorization: Bearer YOUR_LITELLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "CODE_FROM_REDIRECT", "state": "STATE_FROM_START"}'
+```
+
+#### 3. Check Status
+```bash
+curl -X GET http://localhost:4000/auth/claude/status \
+  -H "Authorization: Bearer YOUR_LITELLM_KEY"
+```
+
+#### 4. Refresh Tokens
+```bash
+curl -X POST http://localhost:4000/auth/claude/refresh \
+  -H "Authorization: Bearer YOUR_LITELLM_KEY"
+```
+
+#### 5. Logout
+```bash
+curl -X DELETE http://localhost:4000/auth/claude/logout \
+  -H "Authorization: Bearer YOUR_LITELLM_KEY"
+```
+
+### Method 2: CLI Authentication (For Development)
 
 Run the CLI command to start the OAuth flow:
 
@@ -35,25 +82,9 @@ This will:
 litellm claude callback <CODE>
 ```
 
-### 2. Check Token Status
-
-```bash
-litellm claude status
-```
-
-### 3. Refresh Tokens
-
-Tokens are automatically refreshed, but you can manually refresh:
-
-```bash
-litellm claude refresh
-```
-
-### 4. Logout
-
-```bash
-litellm claude logout
-```
+Check status: `litellm claude status`
+Refresh tokens: `litellm claude refresh`
+Logout: `litellm claude logout`
 
 ## Configuration
 
@@ -107,13 +138,13 @@ general_settings:
 # Tokens are encrypted before storage and linked to user accounts
 ```
 
-## API Endpoints
+## API Endpoints Reference
 
-When running the proxy server, OAuth endpoints are available:
+The proxy server provides these OAuth endpoints:
 
 ### Start OAuth Flow
 ```http
-GET /auth/claude/oauth/start
+POST /auth/claude/start
 ```
 
 Returns:
@@ -126,8 +157,9 @@ Returns:
 
 ### Complete OAuth Flow
 ```http
-POST /auth/claude/oauth/exchange
+POST /auth/claude/callback
 Content-Type: application/json
+Authorization: Bearer YOUR_LITELLM_KEY
 
 {
   "code": "authorization_code_from_callback",
@@ -139,21 +171,69 @@ Returns:
 ```json
 {
   "success": true,
+  "message": "OAuth authentication successful",
   "expires_in": 3600
 }
 ```
 
 ### Check Token Status
 ```http
-GET /auth/claude/oauth/status
+GET /auth/claude/status
+Authorization: Bearer YOUR_LITELLM_KEY
 ```
 
 Returns:
 ```json
 {
   "authenticated": true,
+  "user_id": "user_123",
   "expires_in": 3542,
   "needs_refresh": false
+}
+```
+
+### Refresh Token
+```http
+POST /auth/claude/refresh
+Authorization: Bearer YOUR_LITELLM_KEY
+```
+
+Returns:
+```json
+{
+  "success": true,
+  "message": "Token refreshed successfully"
+}
+```
+
+### Logout
+```http
+DELETE /auth/claude/logout
+Authorization: Bearer YOUR_LITELLM_KEY
+```
+
+Returns:
+```json
+{
+  "success": true,
+  "message": "OAuth tokens cleared successfully"
+}
+```
+
+### Health Check
+```http
+GET /auth/claude/health
+```
+
+Returns:
+```json
+{
+  "status": "healthy",
+  "oauth_configured": true,
+  "token_stats": {
+    "active_tokens": 5,
+    "expired_tokens": 2
+  }
 }
 ```
 

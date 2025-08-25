@@ -33,6 +33,7 @@ import {
 } from "antd";
 import NotificationsManager from "./molecules/notifications_manager";
 import EmailSettings from "./email_settings";
+import ClaudeOAuthSettings from "./claude_oauth_settings";
 
 const { Title, Paragraph } = Typography;
 
@@ -435,6 +436,7 @@ const Settings: React.FC<SettingsPageProps> = ({
             <Tab value="2">Alerting Types</Tab>
             <Tab value="3">Alerting Settings</Tab>
             <Tab value="4">Email Alerts</Tab>
+            <Tab value="5">Claude OAuth</Tab>
           </TabList>
           <TabPanels>
             <TabPanel>
@@ -606,6 +608,9 @@ const Settings: React.FC<SettingsPageProps> = ({
                 premiumUser={premiumUser}
                 alerts={alerts}
               />
+            </TabPanel>
+            <TabPanel>
+              <ClaudeOAuthSettings accessToken={accessToken} />
             </TabPanel>
           </TabPanels>
         </TabGroup>
